@@ -131,10 +131,10 @@ _STYLE = Style.from_dict({
     "footer": "#6b7280",
 })
 
-# UI样式类
+
 class _ApprovalPicker:
     """
-    手绘终端单选 UI：渲染选项、监听键盘上下键与回车确认
+    手绘单选审批 picker，视觉对齐 ask_user_question 的 picker。
     """
 
     def __init__(self, question: str, options: list[tuple[str, str]]):
@@ -210,9 +210,9 @@ class _ApprovalPicker:
         return self.result if self.result is not None else "deny"
 
 
-async def prompt_approval(tool_name: str, args: dict) -> str:
+async def prompt_approval(tool_name: str, args: dict, requester: str = "") -> str:
     """
-    工具执行前弹出审批 picker，返回 "once" / "always" / "deny"。
+    工具执行前弹出审批 picker，返回 "once" / "always" / "deny"。请求来自 sub agent 时用 requester 前缀标明身份。
     """
     options = [
         ("once", "允许"),
@@ -220,6 +220,6 @@ async def prompt_approval(tool_name: str, args: dict) -> str:
         ("deny", "拒绝"),
     ]
     async with in_terminal():
-        question = f"是否允许执行 {_format_call(tool_name, args)}？"
+        question = f"{requester}是否允许执行 {_format_call(tool_name, args)}？"
         choice = await _ApprovalPicker(question, options).run()
     return choice

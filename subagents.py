@@ -223,8 +223,12 @@ _register(AgentType(
 
 def load_agent_types() -> list[AgentType]:
     """
-    从工作目录的 .my-code-agent/agents/*.md 加载自定义 agent 
-    把每个 Markdown 当成一个自定义 sub agent 定义
+    从工作目录的 .my-code-agent/agents/*.md 加载自定义 agent，
+    并在加载完成后立即注册/实例化 `AgentType.agent`。
+
+    也就是说，返回值不仅是“类型清单”，而且每个 `AgentType` 都已绑定好对应的 `Agent` 实例，
+    供后续直接调用 `atype.agent.iter(...)` 或通过 `get_agent_type(name)` 取出使用。
+
     定义：frontmatter 提供 name / description / tools，markdown 正文就是 system prompt。
     举例：
         ---

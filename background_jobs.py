@@ -1,17 +1,19 @@
 """
 本文件是后台任务执行核心层 (`background_jobs.py`)，负责管理 Agent 在本地执行的所有长周期任务后台任务执行层：
-把 shell 命令作为后台 job 运行，输出落盘到日志文件，并跟踪完成状态用于通知
+把 shell 命令或 sub-agent 异步任务作为后台 Job 运行，输出落盘到日志文件，并跟踪完成状态用于通知。
 
 它的核心职责与功能范围包括：
-1. Job 实体定义 (Job)：封装任务的唯一标识、生命周期状态、输出日志落盘路径、进程终止句柄等。
-2. 进程衍生与隔离 (spawn_shell)：通过异步子进程执行 shell 命令，并针对 Windows (CREATE_NEW_PROCESS_GROUP)
-   和 POSIX (start_new_session) 分别实现进程组隔离，确保能够级联杀死整个进程树（避免孤儿进程）。
-3. 异步状态监视 (_watch)：利用 asyncio 协程非阻塞地等待进程退出，并自动更新任务的成败状态。
-4. 进程树安全终止 (_kill_process_tree)：提供跨平台的强力终止机制（Windows 的 taskkill / POSIX 的 killpg）。
-5. 注册表与生命周期调度 (JobRegistry)：
+1. Job 实体定义 (Job)：封装任务的唯一标识、多态类型（shell/agent）、生命周期状态、输出日志落盘路径、终止句柄及最终报告等。
+2. 进程衍生与隔离 (spawn_shell)：通过异步子进程执行 shell 命令，并针对 Windows 和 POSIX 分别实现进程组隔离，确保级联杀死整个进程树。
+3. Sub-Agent 衍生与管理 (spawn_agent)：姊妹方法，专门负责拉起异步 Sub-Agent 任务，将其绑定到协程取消句柄。
+4. 异步状态监视 (_watch 与 _watch_agent)：
+   - _watch：利用 asyncio.subprocess 非阻塞地等待系统进程退出并更新状态。
+   - _watch_agent：非阻塞地等待 sub-agent 协程运行完毕，捕获异常并安全维护任务状态。
+5. 进程树与协程安全终止：提供跨平台的进程树强力终止（Windows taskkill / POSIX killpg）以及协程取消机制。
+6. 注册表与生命周期调度 (JobRegistry)：
    - 会话级（Session-level）的任务生命周期中心。
    - 追踪前台与后台任务的转换（如用户通过 Ctrl+B 将前台耗时任务转入后台）。
-   - 维护「已完成但尚未通知模型」的任务队列 (pop_unnotified)，供后续的 hook 和 reminder 注入给 Agent。
+   - 维护「已完成但尚未通知模型」的任务队列 (pop_unnotified)，供后续 hook 和 reminder 注入给 Agent。
    - 会话退出时的安全清理 (shutdown)。
 """
 from __future__ import annotations
@@ -31,14 +33,9 @@ JOBS_ROOT = Path.home() / ".my-code-agent" / "jobs"
 _ID_ALPHABET = string.digits + string.ascii_lowercase
 
 
-def _new_job_id() -> str:
-    """
-    生成一个唯一的 Job ID。
-    使用随机字符串而非自增计数器的设计考量：
-    即使重启进程、恢复会话后也不会发生 ID 撞车，更不会覆盖掉旧的任务日志。
-    前缀 b 标的是 job 的类型（取 bash 的首字母）
-    """
-    return "b" + "".join(random.choices(_ID_ALPHABET, k=8))
+def _new_job_id(prefix: str) -> str:
+    # 随机 id 而非自增计数：重启进程后恢复会话也不会撞车、不会覆盖旧日志；前缀标 job 类型（b=shell，a=agent）
+    return prefix + "".join(random.choices(_ID_ALPHABET, k=8))
 
 # 定义任务可能处于的几种状态类型
 JobStatus = Literal["running", "completed", "failed", "killed"]
@@ -75,15 +72,18 @@ class Job:
     background: bool = True
     # 由任务创建方（如 spawn_shell）注入的闭包函数，用于后续安全终止该任务及其子进程
     kill_func: Callable[[], None] | None = None
+    # agent 型 job 的最终报告，shell 型 job 不用（输出都在日志文件里）
+    result: str | None = None
 
     def summary(self) -> str:
         """
-        生成一句话描述这个 job 的最终结局，专门用于组装推送给 Agent 的通知文本。
+        一句话描述这个 job 的结局，通知用。
         """
         detail = _STATUS_TEXT[self.status]
         if self.returncode is not None:
             detail += f"，exit code {self.returncode}"
-        return f"后台命令「{self.description}」{detail}"
+        noun = "sub agent" if self.kind == "agent" else "后台命令"
+        return f"{noun}「{self.description}」{detail}"
 
 
 class JobRegistry:
@@ -108,7 +108,7 @@ class JobRegistry:
         3. 注册异步监视协程（_watch），在后台静默等待子进程运行完毕。
         """
         # 1. 生成全局唯一的 Job ID，创建会话专属的日志落盘目录
-        job_id = _new_job_id()
+        job_id = _new_job_id("b")
         # 2. 确保日志存储目录存在
         self._jobs_dir.mkdir(parents=True, exist_ok=True)      
         log_path = self._jobs_dir / f"{job_id}.log"
@@ -147,7 +147,7 @@ class JobRegistry:
         watcher = asyncio.create_task(self._watch(job, proc, log_file))
         # 将该 Task 强引用存入 `self._watchers` 集合，防止被 Python 的 GC 机制提前误杀
         self._watchers.add(watcher)
-        # 挂载 `add_done_callback(self._watchers.discard)`，预定在任务终结时由事件循环自动清理
+        # 挂载 `add_done_callback(self._watchers.discard)`，预定在任务终结时由事件循环自动清理,结束的是wathcer任务
         watcher.add_done_callback(self._watchers.discard)
         return job
 
@@ -166,6 +166,47 @@ class JobRegistry:
         job.returncode = returncode
         # 终结状态写入
         job.status = "completed" if returncode == 0 else "failed"
+
+    async def spawn_agent(self, description: str, run) -> Job:
+        """
+        spawn_shell 的姊妹方法，创建 agent 型 job（一律后台运行）：run 是接收 Job 的异步函数，负责干活并填好 job.result。
+        """
+        job_id = _new_job_id("a")
+        # 落盘日志文件，确保目录存在
+        self._jobs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self._jobs_dir / f"{job_id}.log"
+        log_path.touch()
+        # 实例化 Job 对象（kind="agent"）
+        job = Job(id=job_id, kind="agent", description=description, log_path=log_path)
+        # 核心点 1：把传进来的异步干活函数 `run(job)` 包装成一个独立的 Task 丢给事件循环
+        task = asyncio.create_task(run(job))
+        # shell job 终止是杀进程树，agent job 终止就是取消协程
+        job.kill_func = task.cancel #绑定job.kill_func为task.cancel方法，kill_func被调用时会取消task
+        self._jobs[job_id] = job
+        # 核心点 2：创建一个 watcher 协程，专门盯着这个 sub-agent 任务的运行情况
+        watcher = asyncio.create_task(self._watch_agent(job, task))
+        # 将该 Task 强引用存入 `self._watchers` 集合，防止被 Python 的 GC 机制提前误杀
+        self._watchers.add(watcher)
+        # 挂载 `add_done_callback(self._watchers.discard)`，预定在任务终结时由事件循环自动清理掉watcher任务
+        watcher.add_done_callback(self._watchers.discard)
+        return job
+    
+    async def _watch_agent(self, job: Job, task: asyncio.Task) -> None:
+        try:
+            # 挂起自己，等待 Sub-Agent 协程彻底跑完（期间不消耗 CPU）
+            await task
+        except asyncio.CancelledError:
+            # 如果被外部强行终止（调用了 job.kill() -> task.cancel()），捕获异常直接退出
+            return
+        except Exception as e:
+            # 如果 Sub-Agent 在运行中途崩了、抛了未捕获的异常，捕获异常并写入 job.result，状态置为 failed
+            job.result = f"sub agent 运行出错：{type(e).__name__}: {e}"
+            status = "failed"
+        else:
+            # 完成状态更新
+            status = "completed"
+        if job.status == "running":
+            job.status = status
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)

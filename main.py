@@ -15,7 +15,9 @@ from pydantic_graph import End
 
 import compact
 import mcp_servers
+import permissions
 import session
+import subagents
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
 from agent.reminders import build_job_reminder_text
@@ -110,8 +112,9 @@ async def run_agent_loop(user_input, state):
     )
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history) + mcp工具
-    async with agent.iter(user_input, message_history=state.history, deps=deps,
-                          toolsets=mcp_servers.active_toolsets(),
+    async with agent.iter(
+        user_input, message_history=state.history, deps=deps,
+        toolsets=mcp_servers.active_toolsets(),
     ) as run: #iter是个异步的可迭代对象里面是多个节点（大模型请求和工具调用）
         node = run.next_node
         
@@ -146,6 +149,13 @@ async def main():
         job_registry=JobRegistry(session_id=session_id),
     )
     print_welcome_banner("my-code-agent")
+
+    # 加载并注册 .my-code-agent/agents/ 下的自定义 agent 定义，
+    # 同时会实例化每个 AgentType 的 .agent，确保后续可以直接使用
+    custom_agents = subagents.load_agent_types()
+    if custom_agents:
+        names = "、".join(a.name for a in custom_agents)
+        console.print(f"[dim]已加载 {len(custom_agents)} 个自定义 agent：{names}[/]\n")
 
     # 转圈提示连接进度，否则冷启动拉包时用户会以为卡死了
     with console.status("正在连接 MCP server..."):
@@ -226,13 +236,34 @@ async def main():
         except asyncio.CancelledError:
             pass        # 优雅捕获退出取消信号
 
+    async def watch_approvals():
+        # sub agent 冒泡上来的审批请求：主界面空闲时弹出审批 picker，答复回填给挂起等待的 sub agent
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                if not repl.is_idle:
+                    continue
+                req = subagents.pop_pending_approval()
+                if req is None:
+                    continue
+                choice = await permissions.prompt_approval(
+                    req.tool_name, req.args,
+                    requester=f"sub agent「{req.job.description}」（job {req.job.id}）请求：",
+                )
+                if not req.future.done():
+                    req.future.set_result(choice)
+        except asyncio.CancelledError:
+            pass
+
     # 挂载后台哨兵 Task 到事件循环       
     job_watcher = asyncio.ensure_future(watch_jobs())
+    approval_watcher = asyncio.ensure_future(watch_approvals())
     try:
         await repl.run(on_submit, on_system) # 进入 REPL 主交互死循环（接管前后端输入与系统汇报）
     finally:
         # 安全网：无论正常退出还是异常报错，必须注销后台哨兵任务，防止产生孤儿协程
         job_watcher.cancel()
+        approval_watcher.cancel()
 
     # 退出前给后台记忆任务留收尾时间，提炼写到一半被杀会留下半截记忆
     await background.drain()
