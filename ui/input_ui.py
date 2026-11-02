@@ -97,12 +97,14 @@ class Repl:
         return HTML(f"<ansigreen>{frame}</ansigreen> <b>Working…</b><ansibrightblack>（已耗时 {elapsed}s · 按 esc 打断{hint}）</ansibrightblack>")
 
     def _mode_line(self):
-        # 输入框下方那行：当前权限模式 + 切换提示，有后台 job 在跑时追加个数
+        # 输入框下方那行：当前权限模式 + 切换提示，有后台 job 在跑时按类型追加个数
         mode = permissions.state.mode
         line = f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换）</ansibrightblack>"
-        running = len(self.state.job_registry.running(background=True))
-        if running:
-            line += f"<ansibrightblack> · </ansibrightblack><ansicyan>{running} shell</ansicyan>"
+        running = self.state.job_registry.running(background=True)
+        for kind in ("shell", "agent"):
+            count = sum(1 for job in running if job.kind == kind)
+            if count:
+                line += f"<ansibrightblack> · </ansibrightblack><ansicyan>{count} {kind}</ansicyan>"
         return HTML(line)
 
     def _divider(self):

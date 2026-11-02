@@ -46,7 +46,7 @@ async def run_command(
 
     # 如果明确指定了在后台运行，直接封装并返回后台通知指引，不阻塞主流程
     if run_in_background:
-        return _background_notice(job, f"已放入后台运行，job id: {job.id}")
+        return background_notice(job, f"已放入后台运行，job id: {job.id}")
 
     # --- 前台命令限时等待逻辑 ---
     start = time.monotonic()
@@ -68,7 +68,7 @@ async def run_command(
 
     # 如果在等待期间，用户按了 Ctrl+B 将该前台任务转为了后台运行
     if job.background:
-        return _background_notice(job, f"用户把这条命令转入了后台，它作为 job {job.id} 继续运行")
+        return background_notice(job, f"用户把这条命令转入了后台，它作为 job {job.id} 继续运行")
 
     # --- 前台命令在 10 秒内顺利执行完毕的处理 ---
     # 从落盘的日志文件中读取命令输出
@@ -81,7 +81,7 @@ async def run_command(
     return output or "(无输出)"
 
 
-def _background_notice(job, lead: str) -> str:
+def background_notice(job, lead: str) -> str:
     """
     辅助函数：
     生成统一的后台任务指引说明文本，供「主动放后台」和「Ctrl+B 转后台」共同复用。

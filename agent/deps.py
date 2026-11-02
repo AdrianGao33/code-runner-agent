@@ -12,7 +12,7 @@ Agent 依赖聚合器 (AgentDeps)：基于依赖注入模式的状态聚合容�
 """
 from dataclasses import dataclass
 
-from background_jobs import JobRegistry
+from background_jobs import Job, JobRegistry
 from file_history import FileHistory
 from tasks_store import TasksStore
 from .file_state import ReadFileState
@@ -27,3 +27,5 @@ class AgentDeps:
     file_history: FileHistory | None = None
     # 后台 job 注册表，shell 工具的后台模式和 job_kill 用；后台记忆 fork 不挂
     job_registry: JobRegistry | None = None
+    # 仅 sub agent 的运行挂上：指向它自己对应的 job，审批请求冒泡给用户时用来标识身份
+    subagent_job: Job | None = None

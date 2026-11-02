@@ -10,9 +10,10 @@ from pydantic_ai import Tool
 # 显式触发 shell.py 顶层 permissions.register_self_check 副作用：必须在 import 时就把
 # run_command 的高危特征自检挂上去，否则后续 default 模式下的危险命令直接放行
 from . import shell as _shell  # noqa: F401
+from .agents import run_agent
 from .ask_user import ask_user_question
 from .file import read_and_register, read_file, edit_file, write_file
-from .shell import run_command
+from .shell import job_kill, run_command
 from .tasks import task_create, task_get, task_list, task_update
 
 # Pydantic AI 支持 tools=[plain_function]，从函数签名 + docstring 自动生成 JSON Schema
@@ -24,6 +25,8 @@ TOOLS = [
     Tool(edit_file, sequential=True),
     Tool(write_file, sequential=True),
     run_command,
+    job_kill,
+    run_agent,
     task_create,
     task_list,
     task_get,

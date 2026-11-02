@@ -20,6 +20,7 @@ import compact
 import mcp_servers
 import permissions
 import session
+import subagents
 from agent import ReadFileState
 from background_jobs import JobRegistry
 from file_history import FileHistory
@@ -698,6 +699,19 @@ def cmd_api_detail(state: SessionState) -> bool:
     return True
 
 
+def cmd_agents(state: SessionState) -> bool:
+    """
+    列出 run_agent 可用的 agent 类型。
+    """
+    for atype in subagents.list_agent_types():
+        source = "内置" if atype.source == "built-in" else f"自定义：{atype.source}"
+        console.print(f"  [bold]{atype.name}[/] [bright_black]({source})[/]")
+        console.print(f"      {escape(atype.description)}")
+        console.print(f"      [bright_black]工具：{', '.join(atype.tool_names)}[/]")
+    console.print()
+    return True
+
+
 def cmd_jobs(state: SessionState) -> bool:
     """
     列出本会话的后台 job 及其状态。
@@ -720,6 +734,7 @@ COMMANDS = {
     "compact": Command("compact", "压缩上下文（可带补充指令）", cmd_compact, takes_args=True),
     "status": Command("status", "显示当前会话状态", cmd_status),
     "jobs": Command("jobs", "查看后台 job 列表", cmd_jobs),
+    "agents": Command("agents", "查看可用的 sub agent 类型", cmd_agents),
     "mcp": Command("mcp", "查看 MCP server 状态和工具", cmd_mcp),
     "memory": Command("memory", "查看长期记忆", cmd_memory),
     "dream": Command("dream", "立即整理合并长期记忆", cmd_dream),

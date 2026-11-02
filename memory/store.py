@@ -65,11 +65,12 @@ class MemoryHeader:
     type: str               #""bug_fix"
 
 # 单个记忆子文件元信息
-def _parse_frontmatter(path: Path) -> dict:
+def parse_frontmatter(path: Path) -> dict:
     """
     解析记忆文件头部 frontmatter 里的 name / description / type 字段。
     限制只读取前 FRONTMATTER_MAX_LINES(30) 行，避免大文件带来的性能开销。
     输出一个格式化好的dict，fields:{"name":"...", "description":"...", "type":"..."}
+    subagents.py 复用它加载自定义 agent 定义。
     """
     try:
         with open(path, encoding="utf-8") as f:
@@ -103,7 +104,7 @@ def scan_memory_files() -> list[MemoryHeader]:
         # 空文件是合并整理时被清空的旧记忆，跳过
         if path.stat().st_size == 0:
             continue
-        fields = _parse_frontmatter(path)
+        fields = parse_frontmatter(path)
         headers.append(MemoryHeader(
             filename=path.name,
             path=path,

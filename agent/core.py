@@ -14,27 +14,15 @@ import platform
 from datetime import date
 
 from pydantic_ai import Agent
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.deepseek import DeepSeekProvider
 
+import subagents
 from memory import store
 from memory.instructions import MEMORY_INSTRUCTIONS
 
 from .deps import AgentDeps
 from .hooks import hooks
+from .model import model
 from .tools import TOOLS
-
-# 从环境变量读取 API Key
-API_KEY = os.environ.get("API_KEY")
-if not API_KEY:
-    raise RuntimeError("请先设置环境变量 API_KEY")
-
-MODEL_NAME = "deepseek-flash"
-
-model = OpenAIChatModel(
-    MODEL_NAME,
-    provider=DeepSeekProvider(api_key=API_KEY),
-)
 
 # 静态 instructions 抽成常量，后台记忆 agent 直接复用，保证两边看到同一份约定
 INSTRUCTIONS = (
@@ -45,6 +33,9 @@ INSTRUCTIONS = (
     "如果有错误就修复并重新运行，直到确认正确。\n"
     "长驻或耗时命令（dev server、长测试）用 run_command 的 run_in_background=True 放到后台执行——只在不需要立刻拿到结果时使用，命令末尾不需要加 &。"
     "后台 job 结束后你会收到 <task-notification> 通知，所以不要主动轮询等待；期间可以用 read_file 读它的日志文件查看已有输出，也可以用 job_kill 提前终止。\n"
+    "只要结论、不要过程的任务用 run_agent 交给 sub agent 去做：探索性的代码搜索、独立性强的子任务、需要第二意见的代码审查。"
+    "sub agent 从空白上下文开始工作，任务背景要在 prompt 里交代完整；它的报告只有你能看到，需要转述给用户。"
+    "sub agent 一律在后台运行：派出后不要轮询等待，完成通知会附带报告，没有别的事就先结束本轮。相互独立的任务可以一次派出多个 sub agent 同时干活。一两次工具调用就能搞定的简单任务不要派 sub agent。\n"
     "当你接到一个需要 3 步以上、或需要多次工具调用才能完成的任务时，"
     "先用 task_create 把分解出来的步骤建成 pending task，开工前用 task_update 把要做的那条切到 in_progress，做完立刻切 completed。"
     "如果是琐碎请求（1-2 步、纯对话、纯查询），不要建 task，建了反而碍事。做完的 task 不要让它一直挂在 in_progress。\n"
@@ -91,6 +82,11 @@ def project_context() -> str:
             parts.append("")
             parts.append("以下是项目的 AGENTS.md，请遵循其中的约定：")
             parts.append(content)
+
+    # 注入可用的 sub agent 类型列表：自定义 agent 是启动时从磁盘加载的，走动态注入就不用把清单写死在工具描述里
+    parts.append("")
+    parts.append("run_agent 可用的 agent 类型：")
+    parts.append(subagents.format_agent_listing())
 
     # 注入记忆索引：MEMORY.md 每轮全量注入，模型随时知道自己手头有哪些主题的记忆
     # 走动态 instructions 的好处是每轮拿到最新值——本轮刚写的记忆，下一轮索引里就有
