@@ -24,11 +24,24 @@ import random
 import signal
 import string
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
 JOBS_ROOT = Path.home() / ".my-code-agent" / "jobs"
+
+"""
+因为被监控的后台程序可能会疯狂输出海量日志（比如每秒打印几百行），
+如果把这些内容全部不加过滤地塞给大模型的上下文（Context），
+不仅会瞬间耗尽 Token、把大模型撑爆，还会导致主循环卡死。
+为了解决这个“信息洪流”问题，这里设计了一套滑动窗口限流与熔断保护机制。
+"""
+EVENT_WINDOW = 10.0             #以10秒为一个窗口长度，计算输出频率
+MAX_EVENTS_PER_WINDOW = 20      #每个窗口最多允许 20 行事件输出给大模型，超过的就丢弃并计数
+MAX_PENDING_EVENTS = 200        #如果 Agent 一直在忙别的，没时间消费监控事件，那么待推送事件的最大队列长度，新来的事件会被丢弃并计数，防止内存无限膨胀
+MAX_DROPPED_EVENTS = 100        #最大允许连续/累计丢弃总数 —— 熔断阈值
+MAX_EVENT_CHARS = 500           #单行事件的最大字符数
 
 _ID_ALPHABET = string.digits + string.ascii_lowercase
 
@@ -39,6 +52,7 @@ def _new_job_id(prefix: str) -> str:
 
 # 定义任务可能处于的几种状态类型
 JobStatus = Literal["running", "completed", "failed", "killed"]
+JobKind = Literal["shell", "agent", "monitor"]
 
 # 状态码到人类可读文本的映射，用于生成通知摘要
 _STATUS_TEXT = {
@@ -55,8 +69,8 @@ class Job:
     代表一个具体的后台任务实体，记录了该任务从出生到终结的全生命周期元数据。
     """
     id: str
-    # "shell"，"subagent"
-    kind: str
+    # "shell"，"subagent"，"monitor"
+    kind: JobKind
     description: str
     # Job 的日志输出存储到文件
     log_path: Path
@@ -74,6 +88,12 @@ class Job:
     kill_func: Callable[[], None] | None = None
     # agent 型 job 的最终报告，shell 型 job 不用（输出都在日志文件里）
     result: str | None = None
+    # monitor 型 job 攒着还没推送的事件行；dropped_events 是留着随下次通知上报的丢弃数，dropped_total 只增不减，供熔断判断
+    pending_events: list[str] = field(default_factory=list)
+    dropped_events: int = 0         #当前窗口内被丢弃的事件数（因为输出太快，超出窗口预算或队列已满）
+    dropped_total: int = 0          #全生命期累计被丢弃的事件数（因为输出太快，超出窗口预算或队列已满）
+    window_start: float = 0.0       #滑动时间窗口的起点时间戳
+    window_count: int = 0           #滑动时间窗口内已推送的事件数（用于速率限制）
 
     def summary(self) -> str:
         """
@@ -84,6 +104,26 @@ class Job:
             detail += f"，exit code {self.returncode}"
         noun = "sub agent" if self.kind == "agent" else "后台命令"
         return f"{noun}「{self.description}」{detail}"
+
+    def push_event(self, line: str) -> None:
+        """
+        把一行事件放进待推送队列，受速率限制：超出窗口预算、或队列已经堆满的行只累加丢弃计数。
+        """
+        now = time.monotonic()
+        # 1. 检查并重置滑动时间窗口 (Event Window)
+        if now - self.window_start >= EVENT_WINDOW:
+            self.window_start = now
+            self.window_count = 0
+        self.window_count += 1
+
+        # 2. 速率限制与队列满载保护：超额则丢弃并累计计数，防止内存溢出
+        if self.window_count > MAX_EVENTS_PER_WINDOW or len(self.pending_events) >= MAX_PENDING_EVENTS:
+            self.dropped_events += 1
+            self.dropped_total += 1
+            return
+        
+        # 3. 截断单行最大字符数后压入待推送队列
+        self.pending_events.append(line[:MAX_EVENT_CHARS])
 
 
 class JobRegistry:
@@ -115,18 +155,11 @@ class JobRegistry:
         # 3. 以二进制写模式打开日志文件，用于吸纳子进程的 stdout/stderr
         log_file = open(log_path, "wb")
 
-        # 跨平台进程组隔离处理：
-        # 单独起一个进程组（Process Group），之后才能确保不仅能杀掉主进程，还能把其衍生的子孙进程一并清理掉。
-        if os.name == "nt":
-            group_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-        else:
-            group_kwargs = {"start_new_session": True}
-
         # 启动，初始化，异步执行 shell 命令，将输出绑定到日志文件
         # create_subprocess_shell拉起子进程和初始化，绑定给proc异步子进程对象，任务此时会在后台进行
         # 将进程的 stdout（标准输出流）和 stderr（错误输出流）合并到一起，保存到 log_file 文件中
         proc = await asyncio.create_subprocess_shell(
-            command, stdout=log_file, stderr=subprocess.STDOUT, **group_kwargs
+            command, stdout=log_file, stderr=subprocess.STDOUT, **_process_group_kwargs()
         )
         pid = proc.pid
 
@@ -208,6 +241,93 @@ class JobRegistry:
         if job.status == "running":
             job.status = status
 
+    async def spawn_monitor(self, command: str, description: str, timeout: float | None) -> Job:
+        """
+        【新增方法】：创建 monitor 型后台任务
+        将命令作为监控守护进程运行。非空 stdout 行会实时转换为事件上报；
+        若 timeout 传 None 则持续运行，直到被显式终止或触发熔断。
+        """
+        job_id = _new_job_id("m")
+        self._jobs_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self._jobs_dir / f"{job_id}.log"
+
+        # 1 先拉起一个独立的子进程，stdout/stderr 都重定向到管道（PIPE），由 _pump_monitor 负责泵送输出
+        proc = await asyncio.create_subprocess_shell(
+            command,                            #命令内容（比如 "tail -f app.log"）
+            stdout=asyncio.subprocess.PIPE,     #command运行输出的stdout，连接管道输出缓存
+            stderr=subprocess.STDOUT,           #将子进程的标准错误输出重定向到标准输出，确保最后都会经过管道处理
+            limit=1024 * 1024,                  #设置管道缓冲区大小为 1MB，防止输出过大导致阻塞
+            **_process_group_kwargs(),          #确保子进程在独立的进程组中运行，便于后续统一终止整个进程树
+        )
+        pid = proc.pid
+        job = Job(
+            id=job_id,
+            kind="monitor",
+            description=description,
+            log_path=log_path,
+            kill_func=lambda: _kill_process_tree(pid),
+        )
+        self._jobs[job_id] = job
+
+        # 注册专门用于泵送输出和处理超时的后台监控 Task
+        watcher = asyncio.create_task(self._pump_monitor(job, proc, timeout))
+        self._watchers.add(watcher)
+        watcher.add_done_callback(self._watchers.discard)
+        return job
+
+    async def _pump_monitor(
+        self, job: Job, proc: asyncio.subprocess.Process, timeout: float | None
+    ) -> None:
+        """
+        【新增内部协程】：管道泵送器（Output Pumper）
+        负责从 subprocess.PIPE 异步逐行读取标准输出，同步写日志文件，并推入事件缓冲区。
+        """
+        # 如果设置了超时，拉起一个并行的超时监控任务
+        timer = asyncio.create_task(self._monitor_timeout(job, timeout)) if timeout is not None else None
+        # 行缓冲模式打开日志文件，确保模型随时通过 read_file 都能看到最新输出
+        log_file = open(job.log_path, "w", encoding="utf-8", buffering=1)
+        try:
+            # 每行既写日志留档，也进事件队列等着推给模型
+            try:
+                async for raw in proc.stdout:  #async for 循环异步迭代子进程的 stdout 流，每次迭代获取一行输出，等待子进程输出新行时自动挂起协程，避免阻塞事件循环
+                    line = raw.decode(errors="replace").rstrip("\r\n")
+                    log_file.write(line + "\n")
+                    if not line:
+                        continue
+                    job.push_event(line)
+                    # 触发熔断保护：丢弃事件数达到上限时，主动截断并停掉监控
+                    if job.dropped_total >= MAX_DROPPED_EVENTS:
+                        self._stop_monitor(job, "monitor 已停止：输出太多，请用更精确的过滤条件重新挂载")
+                        break
+            except ValueError:
+                # 异常处理：单行字符过长超过 buffer 限制时，安全终止监控
+                self._stop_monitor(job, "monitor 已停止：单行输出过长，请先在命令中截断或过滤")
+                await proc.wait()
+                return
+            returncode = await proc.wait()
+            if job.status == "killed":
+                return
+            # 等待子进程正常退出并更新状态
+            job.returncode = returncode
+            job.status = "completed" if returncode == 0 else "failed"
+            # 结束消息也走事件通道，标记已通知就不会再走一遍 job 完成通知
+            job.notified = True
+            job.pending_events.append(f"[monitor 已停止：被监控的命令自己退出了，exit code {returncode}]")
+        finally:
+            log_file.close()
+            if timer:
+                timer.cancel()
+
+    async def _monitor_timeout(self, job: Job, timeout: float) -> None:
+        await asyncio.sleep(timeout)
+        if job.status == "running":
+            self._stop_monitor(job, f"monitor 已停止：到了 {int(timeout)} 秒的超时上限，还需要监控就重新挂载")
+
+    def _stop_monitor(self, job: Job, note: str) -> None:
+        # 停止说明直接入队，不受限流影响
+        job.pending_events.append(f"[{note}]")
+        self.kill(job.id)
+
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
@@ -260,6 +380,19 @@ class JobRegistry:
             job.notified = True
         return done
 
+    def pop_events(self) -> list[tuple[Job, list[str], int]]:
+        """
+        取走各 monitor job 攒下的事件并清空；取出即清空，两条通知通道就不会把同一行推两遍。
+        """
+        out = []
+        for job in self._jobs.values():
+            if not job.pending_events and not job.dropped_events:
+                continue
+            out.append((job, job.pending_events, job.dropped_events))
+            job.pending_events = []
+            job.dropped_events = 0
+        return out
+
     def shutdown(self) -> int:
         """
         会话退出清理 (Shutdown)：
@@ -270,6 +403,11 @@ class JobRegistry:
             self.kill(job.id)
         return len(running)
 
+def _process_group_kwargs() -> dict:
+    # 单独起一个进程组，之后才能把子孙进程一并终止
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 def _kill_process_tree(pid: int) -> None:
     """

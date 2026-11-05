@@ -101,7 +101,7 @@ class Repl:
         mode = permissions.state.mode
         line = f"  <ansimagenta><b>▶▶ {mode}</b></ansimagenta><ansibrightblack>（Shift+Tab 切换）</ansibrightblack>"
         running = self.state.job_registry.running(background=True)
-        for kind in ("shell", "agent"):
+        for kind in ("shell", "agent", "monitor"):
             count = sum(1 for job in running if job.kind == kind)
             if count:
                 line += f"<ansibrightblack> · </ansibrightblack><ansicyan>{count} {kind}</ansicyan>"

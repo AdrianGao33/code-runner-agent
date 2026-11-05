@@ -20,7 +20,7 @@ import session
 import subagents
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
-from agent.reminders import build_job_reminder_text
+from agent.reminders import build_job_notifications
 from background_jobs import JobRegistry
 from file_history import FileHistory
 from memory import background, recall, store
@@ -129,7 +129,7 @@ async def run_agent_loop(user_input, state):
             elif Agent.is_model_request_node(node):     # 节点类型判断 B：如果是“准备发起下一次模型请求”
                 for part in node.request.parts:
                      #异常报错是agent会把报错包成一个“retry-prompt"part,用来给大模型理解错误原因
-                    if part.part_kind in ("tool-return", "retry-prompt"): 
+                    if part.part_kind == "tool-return":
                         print_part(part)                # 实时将“工具在本地执行返回的结果”渲染到终端
 
     apply_result(state, run.result)         # 当循环遇到 End 节点退出后，run.result 会自动结算出最终的 AgentRunResult
@@ -230,7 +230,7 @@ async def main():
                 await asyncio.sleep(1)          # 每秒醒来一次，零 CPU 压力
                 if not repl.is_idle:
                     continue
-                text = build_job_reminder_text(state.job_registry)
+                text = build_job_notifications(state.job_registry)
                 if text:
                     repl.submit_system(text)    # 触发系统自主对话轮
         except asyncio.CancelledError:

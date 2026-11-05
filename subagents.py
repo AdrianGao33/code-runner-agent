@@ -122,7 +122,7 @@ async def _sub_job_notifications(ctx, request_context):
 
 # ---------- agent 类型定义 ----------
 
-# sub agent 可用的全部工具；run_agent、ask_user_question、task_*、job_kill 都被排除在外
+# sub agent 可用的全部工具；run_agent、ask_user_question、task_*、job_kill、monitor 都被排除在外
 _TOOL_FUNCS = {
     "read_file": read_file,
     "edit_file": edit_file,
@@ -344,7 +344,7 @@ async def run_subagent(atype: AgentType, prompt: str, job: Job, parent_deps: Age
                         _log_part(log, part)
                 elif Agent.is_model_request_node(node):
                     for part in node.request.parts:
-                        if part.part_kind in ("tool-return", "retry-prompt"):
+                        if part.part_kind == "tool-return":
                             _log_part(log, part)
         job.result = run.result.output or "(sub agent 没有输出报告)"
         log.write(f"=== 最终报告 ===\n{job.result}\n")
@@ -369,10 +369,10 @@ def _format_part(part) -> str | None:
         return f"✻ {part.content}"
     if kind == "tool-call":
         return f"⏺ {part.tool_name}({_squash(part.args, 200)})"
+    if kind == "tool-return" and part.outcome == "retried":
+        return f"✘ {part.tool_name}: {_squash(part.content, 200)}"
     if kind == "tool-return":
         return f"✔ {part.tool_name} -> {_squash(part.content, 500)}"
-    if kind == "retry-prompt":
-        return f"✘ {part.tool_name}: {_squash(part.content, 200)}"
     return None
 
 

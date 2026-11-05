@@ -8,6 +8,8 @@ System Reminder 提示词构建器：环境状态感知与 Task 进度的 Prompt
 2. Task 状态提醒 (build_task_reminder_text)：
    结合 TasksStore 主动将最新任务列表推回 Prompt（免去 task_list），并提供哨兵文案供 Hook 识别冷却时间。
 """
+from html import escape as escape_xml #把一些危险的特殊字符进行安全转换（转义）
+
 from rich.markup import escape
 
 from background_jobs import JobRegistry
@@ -82,3 +84,39 @@ def build_job_reminder_text(registry: JobRegistry | None) -> str | None:
             "</task-notification>"
         )
     return "\n\n".join(blocks)
+
+def build_monitor_event_text(registry: JobRegistry | None) -> str | None:
+    """
+    把各 monitor 自上次以来攒下的事件行拼成 <monitor-event> 通知；没有新事件就返回 None。
+    """
+    if registry is None:
+        return None
+    popped = registry.pop_events()
+    if not popped:
+        return None
+    blocks = []
+    for job, events, dropped in popped:
+        notice = f"monitor「{escape(job.description)}」{len(events)} 条新事件"
+        if dropped:
+            notice += f"（另有 {dropped} 条被省略）"
+        console.print(f"[cyan]●[/] {notice}\n")
+        omitted = f"<dropped>另有 {dropped} 条事件因为输出过快被省略，需要的话用更精确的过滤条件重新挂载</dropped>\n" if dropped else ""
+        description = escape_xml(job.description, quote=False)
+        event_text = escape_xml(chr(10).join(events), quote=False)
+        blocks.append(
+            "<monitor-event>\n"
+            f"<task-id>{job.id}</task-id>\n"
+            f"<description>{description}</description>\n"
+            f"<events>\n{event_text}\n</events>\n"
+            f"{omitted}"
+            "</monitor-event>"
+        )
+    return "\n\n".join(blocks)
+
+
+def build_job_notifications(registry: JobRegistry | None) -> str | None:
+    """
+    job 注册表对外的唯一通知出口：完成的 job 加上 monitor 事件，两条投递通道都只问这一个函数。
+    """
+    parts = [build_job_reminder_text(registry), build_monitor_event_text(registry)]
+    return "\n\n".join(p for p in parts if p) or None

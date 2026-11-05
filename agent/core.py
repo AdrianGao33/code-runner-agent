@@ -13,6 +13,7 @@ import os
 import platform
 from datetime import date
 
+import pydantic_ai
 from pydantic_ai import Agent
 
 import subagents
@@ -24,6 +25,9 @@ from .hooks import hooks
 from .model import model
 from .tools import TOOLS
 
+# 关掉 pydantic-ai 首次运行时打印的横幅，免得它插进终端界面
+pydantic_ai.BANNER_ENABLED = False
+
 # 静态 instructions 抽成常量，后台记忆 agent 直接复用，保证两边看到同一份约定
 INSTRUCTIONS = (
     "你是一个编程助手。你可以读写文件和执行命令来帮用户完成编程任务。\n"
@@ -33,6 +37,7 @@ INSTRUCTIONS = (
     "如果有错误就修复并重新运行，直到确认正确。\n"
     "长驻或耗时命令（dev server、长测试）用 run_command 的 run_in_background=True 放到后台执行——只在不需要立刻拿到结果时使用，命令末尾不需要加 &。"
     "后台 job 结束后你会收到 <task-notification> 通知，所以不要主动轮询等待；期间可以用 read_file 读它的日志文件查看已有输出，也可以用 job_kill 提前终止。\n"
+    "后台 job 是结束时通知你一次，monitor 是运行期间每有事件就通知你一次；某件事每发生一次你都想知道，就用它。它的事件按自己的节奏到达，哪怕正好在你等用户答复时冒出来，也不是用户的回复。\n"
     "只要结论、不要过程的任务用 run_agent 交给 sub agent 去做：探索性的代码搜索、独立性强的子任务、需要第二意见的代码审查。"
     "sub agent 从空白上下文开始工作，任务背景要在 prompt 里交代完整；它的报告只有你能看到，需要转述给用户。"
     "sub agent 一律在后台运行：派出后不要轮询等待，完成通知会附带报告，没有别的事就先结束本轮。相互独立的任务可以一次派出多个 sub agent 同时干活。一两次工具调用就能搞定的简单任务不要派 sub agent。\n"

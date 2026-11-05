@@ -21,7 +21,7 @@ import classifier
 import permissions
 from ui.render import console, print_step, print_system_text
 
-from .reminders import build_job_reminder_text, build_file_reminder_text, build_task_reminder_text
+from .reminders import build_job_notifications, build_file_reminder_text, build_task_reminder_text
 
 MAX_RETRIES = 3
 
@@ -158,8 +158,8 @@ def _build_task_reminder(ctx, messages) -> str | None:
     return build_task_reminder_text(ctx.deps.tasks_store)
 
 def _build_job_reminder(ctx, messages) -> str | None:
-    # turn 进行中完成的后台 job，在下一次 model 请求前顺路通知
-    return build_job_reminder_text(ctx.deps.job_registry)
+    # turn 进行中完成的后台 job、以及 monitor 期间攒下的事件，都在下一次 model 请求前顺路通知
+    return build_job_notifications(ctx.deps.job_registry)
 
 # 注册要在 before_model_request 触发的 reminder builder：每条 (sentinel, builder)，sentinel 仅用于回扫识别（task reminder 复用）
 _REMINDER_SENTINELS = {
@@ -250,7 +250,7 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
         # 放行，handler(args) 才是真正执行工具的那一步
         return await handler(args)
 
- # 当规则要求询问 ("ask") 且处于 AUTO 模式：交由 classifier 智能审查
+    # 当规则要求询问 ("ask") 且处于 AUTO 模式：交由 classifier 智能审查
     if permissions.state.mode == permissions.AUTO:
         # 审查过程对齐成和 thinking、tool_call 一样的「图标 + 标签独占一行、内容换行」格式，用蓝色让用户一眼看到 classifier 在工作
         print_step("[blue]◆ auto_check[/]", f"[blue dim]正在请 LLM 审查 {call.tool_name}...[/]")
