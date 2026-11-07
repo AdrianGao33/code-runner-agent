@@ -13,6 +13,8 @@ from pydantic_ai import RunContext
 # PydanticAI 专有异常：抛出后框架会自动生成 retry-prompt 塞回给大模型，要求其修正参数重试
 from pydantic_ai.exceptions import ModelRetry
 
+import images
+
 from ..deps import AgentDeps
 from ..file_state import ReadFileState
 
@@ -66,6 +68,8 @@ def read_and_register(state: ReadFileState, path: str, offset: int = 1, limit: i
 def read_file(ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int | None = None) -> str:
     """
     读取文件内容，输出带行号（类似 cat -n 格式）。
+    这个工具可以读取图片（png/jpg/gif/webp）。图片文件会以图像形式呈现给你，因为你是多模态模型。
+    你会经常被要求查看截图。只要用户给出截图的路径，一律用这个工具去查看。
     大文件请用 offset 和 limit 分段读取，不必一次读完。
     后续用 edit_file 编辑时，old_string 和 new_string 里不要包含行号前缀。
 
@@ -74,6 +78,15 @@ def read_file(ctx: RunContext[AgentDeps], path: str, offset: int = 1, limit: int
         offset: 从第几行开始读，从 1 算起（默认 1 = 文件开头）
         limit: 读多少行；不传则最多读 DEFAULT_MAX_LINES 行
     """
+    # 图片单独一条路：不切行、不加行号、不登记，直接把字节交出去
+    if images.is_image(path):
+        try:
+            return images.load_image(path)
+        except FileNotFoundError:
+            raise ModelRetry(f"图片 {path} 不存在，请确认路径")
+        except OSError as e:
+            return f"错误：无法读取图片 {path}：{e}"
+        
     # 1. 省token不读：readFileState 里有记录、同范围、同 mtime → 跳过不读
     state = ctx.deps.read_file_state
     record = state.get(path)

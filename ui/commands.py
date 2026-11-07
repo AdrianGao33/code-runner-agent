@@ -7,6 +7,7 @@ from typing import Callable, Optional
 
 import questionary
 from prompt_toolkit.application import Application, in_terminal
+from pydantic_ai import BinaryContent
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
@@ -119,12 +120,12 @@ def _format_part_line(part) -> Optional[str]:
     if kind == "tool-call":
         # 命令、路径动辄上百字符，参数放宽到 500 字符再截断
         return f"[yellow]⏺ tool_call[/]\n  [yellow dim]{part.tool_name}({_truncate(part.args, 500)})[/]"
+    if kind == "tool-return" and part.outcome == "retried":
+        # 工具抛 ModelRetry 后，SDK 把错误作为 outcome 为 retried 的工具结果反馈给模型，标签用 ✘ 表示这次调用失败
+        return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
     if kind == "tool-return":
         # 工具成功返回，标签用 ✔
         return f"[magenta]✔ tool_return[/]\n  [magenta dim]{part.tool_name} -> {_truncate(part.content)}[/]"
-    if kind == "retry-prompt":
-        # 工具抛 ModelRetry 后，SDK 生成 retry-prompt 把错误反馈给模型，标签用 ✘ 表示这次调用失败
-        return f"[yellow]✘ tool_retry[/]\n  [yellow dim]{part.tool_name} -> {_truncate(part.content)}[/]"
     return None
 
 
@@ -196,6 +197,11 @@ def _print_file_op(part) -> bool:
         # read_file 的返回已经是带行号的内容，按行截断预览
         console.print("[magenta]✔ tool_return[/]")
         console.print(Padding("[magenta dim]read_file[/]", (0, 0, 0, 2)))
+        # 图片返回的是二进制，直接打会刷屏，只报一行尺寸信息
+        if isinstance(part.content, BinaryContent):
+            size = len(part.content.data) / 1024
+            console.print(f"  [magenta dim]图片 {part.content.media_type}，{size:.0f} KB[/]")
+            return True
         lines = str(part.content).splitlines()
         for ln in lines[:_PREVIEW_MAX_LINES]:
             console.print(f"  [dim]{escape(ln)}[/]")

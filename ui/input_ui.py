@@ -1,4 +1,5 @@
 import asyncio
+import platform
 import re
 import time
 from html import escape as html_escape
@@ -18,6 +19,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.markup import escape
 
+import images
 import permissions
 from mentions import list_candidate_files
 from .render import console, print_system_text
@@ -26,6 +28,11 @@ from .render import console, print_system_text
 
 # working 指示器的转圈动画帧
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# 粘贴图片后插进输入框的占位符，退格时按整段删除
+_IMAGE_PLACEHOLDER = re.compile(r"\[Image #(\d+)\]")
+# 同一个占位符，但锚定在末尾，用来判断光标是不是正好停在它后面
+_IMAGE_PLACEHOLDER_AT_END = re.compile(r"\[Image #(\d+)\]$")
 
 # task 面板每行的渲染模板，键是 task.status，值里的 {s} 是 escape 后的 subject
 _TASK_ROW_TEMPLATES = {
@@ -67,6 +74,8 @@ class Repl:
         self.working = False
         self._work_start = 0.0
         self._frame = 0
+        # 已粘贴、还没发出去的图片，攒在这里等下一次回车带走
+        self._pending_images = []
         # 给输入缓冲区挂上 @ 文件补全器，complete_while_typing 让候选随敲随出，不用按 Tab
         self._buffer = Buffer(
             multiline=False,
@@ -178,7 +187,7 @@ class Repl:
             if self._task is not None:
                 self._task.cancel()
             else:
-                self._buffer.reset()
+                self._clear_input()
 
         @kb.add("c-d")
         def _(event):
@@ -196,7 +205,46 @@ class Repl:
             # 把正在前台跑的命令转入后台，工具调用会立即带着 job id 返回
             self.state.job_registry.move_to_background()
 
+        # Windows 用 Alt+V 粘贴图片，保留 Ctrl+V 粘贴文本
+        image_paste_keys = ("escape", "v") if platform.system() == "Windows" else ("c-v",)
+
+        @kb.add(*image_paste_keys)
+        def _(event):
+            image = images.read_clipboard_image()
+            if image is None:
+                return
+            # 添加图片附件，并在输入框中显示占位符
+            self._pending_images.append(image)
+            self._buffer.insert_text(f"[Image #{len(self._pending_images)}]")
+
+        @kb.add("backspace")
+        def _(event):
+            # 光标正好停在占位符后面时，整段删掉，并把它对应的那张图也移除
+            match = _IMAGE_PLACEHOLDER_AT_END.search(self._buffer.document.text_before_cursor)
+            if match is None:
+                self._buffer.delete_before_cursor(1)
+                return
+            self._buffer.delete_before_cursor(len(match.group()))
+            index = int(match.group(1)) - 1
+            if 0 <= index < len(self._pending_images):
+                self._pending_images.pop(index)
+            self._renumber_placeholders()
+
         return kb
+
+    def _renumber_placeholders(self):
+        # 删掉中间某张图后，剩下的占位符重新编号，编号和 _pending_images 的下标始终对得上
+        seq = iter(range(1, len(self._pending_images) + 1))
+        cursor = self._buffer.cursor_position
+        self._buffer.text = _IMAGE_PLACEHOLDER.sub(
+            lambda _: f"[Image #{next(seq)}]", self._buffer.text
+        )
+        self._buffer.cursor_position = min(cursor, len(self._buffer.text))
+
+    def _clear_input(self):
+        # 清空输入行时连同已粘贴的图片一起丢掉，否则占位符没了图还留着，会跟下一条消息一起发出去
+        self._buffer.reset()
+        self._pending_images.clear()
 
     def _on_enter(self):
         # 补全菜单正开着且有高亮项时，回车先采纳补全，不提交输入
@@ -208,15 +256,18 @@ class Repl:
             return
         text = self._buffer.text.strip()
         if not text:
-            self._buffer.reset()
+            self._clear_input()
             return
         # 存进输入历史，清空输入行
         self._buffer.history.append_string(text)
         self._buffer.reset()
         # 把这行回显到上方滚动区，留下记录（输入框常驻，不回显的话提交后这行就没了）
         self._echo_input(text)
+        # 攒着的图片跟这轮输入一起交出去，交完清空，下一轮重新攒
+        attachments = self._pending_images
+        self._pending_images = []
         # 把处理丢进后台任务，回车处理立刻返回，输入框继续渲染、随时能打断
-        self._task = self.app.create_background_task(self._process(text))
+        self._task = self.app.create_background_task(self._process(text, attachments=attachments))
 
     def _echo_input(self, text):
         # 回显刚提交的一行：上下分割线夹住 ❯ 文本，和输入框观感一致
@@ -226,11 +277,11 @@ class Repl:
         console.print(f"[bright_black]{rule}[/]")
         console.print()
 
-    async def _process(self, text, handler=None):
+    async def _process(self, text, handler=None, attachments=None):
         # 后台任务：交给对应回调（默认是用户输入的 on_submit），统一兜住打断和异常
         handler = handler or self._on_submit
         try:
-            await handler(text)
+            await handler(text, attachments or [])
         except asyncio.CancelledError:
             console.print("\n[bold yellow]已中断[/]\n")
         except Exception as e:

@@ -21,6 +21,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
+import images
 from agent.file_state import ReadFileState
 from agent.tools import read_and_register
 
@@ -30,7 +31,7 @@ from agent.tools import read_and_register
 AT_MENTION_RE = re.compile(r"(?:^|\s)@([\w./~\\\-]+)")
 
 # 用户Prompt里，提取需要记录的文件名字（可能是多个），给main用的
-# “请帮我修改 @abc.py 和 @utils.py” --> seen = ["abc.py" , "utils.py"]
+# “请帮我修改 @abc.ping 和 @utils.py” --> seen = ["abc.ping" , "utils.py"]
 def extract_at_mentions(text: str) -> list[str]:
     """
     从用户 Prompt 中解析出所有的 @path 路径，去重并保持出现顺序
@@ -42,18 +43,33 @@ def extract_at_mentions(text: str) -> list[str]:
             seen.append(path)
     return seen
 
-# 把每个文件都读一遍、记录read_file_state、上下文append假模型和工具交互消息，给main用的
-def build_mention_messages(paths: list[str], state: ReadFileState) -> list:
+def build_mention_messages(
+    paths: list[str], state: ReadFileState
+) -> tuple[list, list, list[str]]:
     """
-    把每个被 @ 的文件读出来，为它伪造一对 read_file 的 tool_call + tool_return，返回要塞进历史的消息列表。
+    读取每个被 @ 的路径，文本文件伪造成一对 read_file 的 tool_call + tool_return。
     read_and_register 顺手把文件登记进 readFileState，和真正的 read_file 调用一模一样，之后 edit_file 就不会被拦。
+
+    返回历史消息、图片附件，以及图片原本的 @ 路径。
     """
-    messages = []
+    messages = []       # 用于存放伪造的对话历史消息（针对文本文件）
+    attachments = []    # 用于存放多模态图片二进制内容（BinaryContent）
+    image_paths = []    # 用于存放图片的原始 @ 路径，方便后续替换成 [Image #N] 占位符
     for path in paths:
         abs_path = os.path.abspath(os.path.expanduser(path))
-        
+        # 不存在的路径、目录都跳过，简化处理
         if not os.path.isfile(abs_path):
-            continue    # 不存在的路径、目录都跳过，简化处理
+            continue
+
+        # 图片不进历史，收进附件列表，等下和用户这轮输入拼在一起发出去
+        if images.is_image(abs_path):
+            try:
+                attachments.append(images.load_image(abs_path))
+                image_paths.append(path)
+            except OSError:
+                continue
+            continue
+
         try:
             numbered = read_and_register(state, abs_path) #触发：读+记录
         except (OSError, UnicodeDecodeError):
@@ -75,8 +91,26 @@ def build_mention_messages(paths: list[str], state: ReadFileState) -> list:
                 parts=[ToolReturnPart(tool_name="read_file", content=numbered, tool_call_id=call_id)]
             )
         )
-    return messages
+    return messages, attachments, image_paths
 
+# @error.png 替换成 [Image #1]，@screenshot.jpg 替换成 [Image #2]，保留前后文本上下文
+def replace_image_mentions(text: str, image_paths: list[str], first_index: int) -> str:
+    """
+    把图片 @path 原地换成对应的内部图片占位符。
+    """
+    # 建立一个映射字典：把具体的图片路径映射为对应的序号占位符索引（如 {"error.png": 1}）
+    indexes = {path: first_index + offset for offset, path in enumerate(image_paths)}
+
+    def replace(match):
+        path = match.group(1)
+        index = indexes.get(path)
+        if index is None:
+            return match.group(0)   # 如果不是图片路径，保持原样
+        # 提取 @ 前面的前缀（例如空格或标点），然后拼接成 [Image #N]
+        prefix = match.group(0).removesuffix(f"@{path}")
+        return f"{prefix}[Image #{index}]"
+    # 利用全局正则 AT_MENTION_RE 结合上面定义好的 replace 闭包函数进行全局替换
+    return AT_MENTION_RE.sub(replace, text)
 
 # 遍历目录时要跳过的垃圾/缓存目录（黑名单）
 IGNORED_DIRS = {"__pycache__", "node_modules", "venv", "dist", "build", "target"}

@@ -14,6 +14,7 @@ from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点�
 from pydantic_graph import End
 
 import compact
+import images
 import mcp_servers
 import permissions
 import session
@@ -36,7 +37,11 @@ from ui.commands import (
 )
 # 导入手搓的终端常驻交互式输入组件 Repl
 from ui.input_ui import Repl
-from mentions import build_mention_messages, extract_at_mentions
+from mentions import (
+    build_mention_messages,
+    extract_at_mentions,
+    replace_image_mentions,
+)
 
 async def handle_command(user_input, state) -> str:
     """
@@ -75,16 +80,20 @@ def apply_result(state, result):
     # 把本轮新增的消息追加到会话文件
     session.append_messages(state.session_id, result.new_messages())
 
-def inject_at_mentions(user_input, state):
+def inject_at_mentions(user_input, state, first_image_index):
     """
-    解析用户输入里的 @path，把每个被引用的文件伪装成一次 read_file 调用，在 Agent 跑起来之前塞进对话历史。
+    解析 @path：文本文件作为 read_file 调用写入历史，图片路径换成占位符。
+    返回换好图片占位符的用户输入和图片附件。
     """
-    paths = extract_at_mentions(user_input) #提取@后面的路径
+    paths = extract_at_mentions(user_input)
     if not paths:
-        return
-    mention_messages = build_mention_messages(paths, state.read_file_state) # 2. 读取文件、登记 ReadFileState 账本，并构建成对的伪造消息 (ModelResponse + ModelRequest)
+        return user_input, []
+    mention_messages, attachments, image_paths = build_mention_messages(
+        paths, state.read_file_state
+    )
+    user_input = replace_image_mentions(user_input, image_paths, first_image_index)
     if not mention_messages:
-        return
+        return user_input, attachments
     # 塞进历史上下文：模型下一轮就能看到这些「读文件」记录，以为是自己读的
     state.history += mention_messages
     # 更新jsonl持久化，/resume 恢复会话时能连同引用进来的文件内容一起还原
@@ -93,15 +102,19 @@ def inject_at_mentions(user_input, state):
     for msg in mention_messages:
         for part in msg.parts:
             print_part(part)
+    return user_input, attachments
 
 
-async def run_agent_loop(user_input, state):
+async def run_agent_loop(user_input, state, attachments=None):
     """
     核心白盒驱动引擎：
     摒弃黑盒 run_sync()，使用 agent.iter() 逐节点 (Node) 驱动 Agent 图状态机流转。
     实现“边思考、边调工具、边实时输出”的流式效果。
     """
     api_call_log.clear() # 每轮新对话发起前，清空全局 API 调用日志 Buffer（只记上次调用）
+    # 用 [Image #N] 的位置组装有序的文本和图片内容块
+    if attachments:
+        user_input = images.build_user_content(user_input, attachments)
 
    # deps 把本会话的 readFileState 和 tasksStore 一起打包成 AgentDeps 注入工具层，工具内通过 ctx.deps.* 访问
     deps = AgentDeps(
@@ -163,7 +176,7 @@ async def main():
     if mcp_summary:
         console.print(mcp_summary + "\n")
 
-    # 常驻输入区：输入框整个会话期间不消失
+    # 常驻输入区：输入框整个会话期间不消失。task 面板通过 state.tasks_store 拉数据，所以 /new、/resume 换会话时不需要重新接线
     repl = Repl(state)
 
     # =========================================================================
@@ -172,7 +185,7 @@ async def main():
     # 【生命周期】按需触发（即点即跑），走完整的前置用户意图解析流程。
     # =========================================================================
 
-    async def on_submit(user_input):
+    async def on_submit(user_input, attachments):
         # 用户每次按下回车提交，均触发此函数
 
         # 1. 拦截并处理斜杠命令（如 /exit, /clear）
@@ -190,17 +203,20 @@ async def main():
         # 3. 创建回退检查点：此刻 @ 引用和记忆召回还没注入，len(history) 就是干净的回退下标
         state.file_history.make_checkpoint(len(state.history), user_input)
 
-        # 4. 解析 @ 引用，把被引用的文件伪装成 read_file 调用塞进历史
-        inject_at_mentions(user_input, state)
+        # 4. 文本文件塞进历史，图片 @path 原地换成图片占位符
+        agent_input, mentioned_images = inject_at_mentions(
+            user_input, state, len(attachments) + 1
+        )
+        attachments = attachments + mentioned_images
 
-        # 2. 切换 UI 为工作状态（显示思考中动画/指示器）
+        # 2. 核心 Agent 循环：开请求时显示 working...，结束 / 被打断后由 Repl 统一隐藏；中途按 ESC / Ctrl+C 会打断
         repl.start_working()
 
-        # 4. 专属流程：召回长效记忆，让模型带着历史经验处理本轮输入
+        # 4. 召回相关记忆塞进历史，模型带着过去积累的经验处理本轮输入
         await recall.inject_memories(user_input, state)
 
         # 5. 跑主循环 Agent 图
-        result = await run_agent_loop(user_input, state)
+        result = await run_agent_loop(user_input, state, attachments)
 
         # 6. 本轮结束后由后台提炼记忆
         background.schedule(state, result.new_messages())
@@ -210,7 +226,7 @@ async def main():
     # 【触发场景】由后台任务监控哨兵（watch_jobs）在空闲时检测到后台 Job 完成后自主触发。
     # 【生命周期】异步事件驱动，无需用户干预，让 Agent 实现“自主向用户汇报”。
     # =========================================================================
-    async def on_system(text):
+    async def on_system(text, attachments=None):
         # 系统触发的对话轮（后台 job 完成通知）：跳过检查点、@ 解析和记忆召回，直接跑 Agent
         await compact.auto_compact_if_needed(state)
         repl.start_working()
