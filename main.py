@@ -10,6 +10,7 @@
 """
 import asyncio # Python 标准异步库，支持 async/await 协程语法
 
+from openai import skills
 from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点。每个模型请求/工具调用都是一个 Node，遇到 End 循环终止
 from pydantic_graph import End
 
@@ -18,6 +19,7 @@ import images
 import mcp_servers
 import permissions
 import session
+import skills
 import subagents
 from agent import agent, MODEL_NAME, api_call_log
 from agent.deps import AgentDeps
@@ -169,6 +171,12 @@ async def main():
     if custom_agents:
         names = "、".join(a.name for a in custom_agents)
         console.print(f"[dim]已加载 {len(custom_agents)} 个自定义 agent：{names}[/]\n")
+
+    # 启动时只发现 skill 的名称和描述，完整指令等任务真正匹配后再读取
+    available_skills = skills.discover_skills()
+    if available_skills:
+        names = "、".join(skill.name for skill in available_skills)
+        console.print(f"[dim]发现 {len(available_skills)} 个 skill：{names}[/]\n")
 
     # 转圈提示连接进度，否则冷启动拉包时用户会以为卡死了
     with console.status("正在连接 MCP server..."):

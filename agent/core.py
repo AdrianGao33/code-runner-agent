@@ -16,6 +16,7 @@ from datetime import date
 import pydantic_ai
 from pydantic_ai import Agent
 
+import skills
 import subagents
 from memory import store
 from memory.instructions import MEMORY_INSTRUCTIONS
@@ -92,6 +93,12 @@ def project_context() -> str:
     parts.append("")
     parts.append("run_agent 可用的 agent 类型：")
     parts.append(subagents.format_agent_listing())
+
+    # skill 清单只放 name + description；完整 SKILL.md 等模型判断相关后再通过 load_skill 读取
+    skill_listing = skills.format_skill_listing(skills.discover_skills())
+    if skill_listing:
+        parts.append("")
+        parts.append(skill_listing)
 
     # 注入记忆索引：MEMORY.md 每轮全量注入，模型随时知道自己手头有哪些主题的记忆
     # 走动态 instructions 的好处是每轮拿到最新值——本轮刚写的记忆，下一轮索引里就有

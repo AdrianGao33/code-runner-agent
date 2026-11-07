@@ -7,6 +7,8 @@
 """
 from pydantic_ai import Tool
 
+from skills import load_skill
+
 # 显式触发 shell.py 顶层 permissions.register_self_check 副作用：必须在 import 时就把
 # run_command 的高危特征自检挂上去，否则后续 default 模式下的危险命令直接放行
 from . import shell as _shell  # noqa: F401
@@ -24,6 +26,7 @@ from .tasks import task_create, task_get, task_list, task_update
 
 TOOLS = [
     read_file,
+    load_skill,
     Tool(edit_file, sequential=True),
     Tool(write_file, sequential=True),
     run_command,
