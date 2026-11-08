@@ -11,6 +11,7 @@ Agent 依赖聚合器 (AgentDeps)：基于依赖注入模式的状态聚合容�
    - 保证了在多轮工具调用链中，底层 ReadFileState（过时文件检测）与 TasksStore（任务落盘与自增 ID）的单例引用与状态一致性。
 """
 from dataclasses import dataclass
+from pathlib import Path
 
 from background_jobs import Job, JobRegistry
 from file_history import FileHistory
@@ -29,3 +30,5 @@ class AgentDeps:
     job_registry: JobRegistry | None = None
     # 仅 sub agent 的运行挂上：指向它自己对应的 job，审批请求冒泡给用户时用来标识身份
     subagent_job: Job | None = None
+   # 当前会话的 plan 文件，plan 模式下主 agent 唯一可以写入的文件
+    plan_file: Path | None = None

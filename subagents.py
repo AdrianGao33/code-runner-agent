@@ -42,10 +42,17 @@ sub_hooks = Hooks()
 @sub_hooks.on.tool_execute
 async def _check_sub_permission(ctx, *, call, tool_def, args, handler):
     """
-    compute_decision检查 + AUTO模式下的独立模型实例单独提问判断是否放行
+    sub agent 的权限关卡。规则放行的照常执行；auto 模式先交给 classifier 审查；需要人工审批的调用不能直接弹窗（sub agent 在后台运行），把请求排队冒泡给用户，挂起等待答复。
     """
-    if permissions.compute_decision(call.tool_name, args) == "allow":
+    decision = permissions.compute_decision(call.tool_name, args)
+    if decision == "allow":
         return await handler(args)
+    if decision == "deny":
+        # plan 模式下 sub agent 没有 plan 文件，写文件一律拒绝
+        return (
+            f"当前处于 plan 模式，sub agent 不能修改文件，这次 {call.tool_name} 调用没有执行。"
+            "请只做只读调查，把需要的改动写进最终报告。"
+        )
     # auto 模式的 classifier 本来就是无人值守的审批官，sub agent 照常用它；classifier 自己出错则回退到下面的人工审批
     if permissions.state.mode == permissions.AUTO:
         verdict = await classifier.classify(ctx.messages, call.tool_name, args)
@@ -119,6 +126,22 @@ async def _sub_job_notifications(ctx, request_context):
     messages.append(ModelRequest(parts=[UserPromptPart(content=text)]))
     return dataclasses.replace(request_context, messages=messages)
 
+# plan 模式下派出的 sub agent 也只能做只读调查
+SUB_PLAN_REMINDER = (
+    "<system-reminder>\n"
+    "plan 模式已开启。用户希望先看到方案再动手：你不能修改任何文件，也不能执行任何会改动系统的命令。"
+    "只做只读调查，需要的改动写进最终报告。\n"
+    "</system-reminder>"
+)
+
+@sub_hooks.on.before_model_request
+async def _sub_plan_reminder(ctx, request_context):
+    # 只在 sub agent 的第一轮请求前注入一次
+    messages = list(request_context.messages)
+    if permissions.state.mode != permissions.PLAN or len(messages) > 1:
+        return request_context
+    messages.append(ModelRequest(parts=[UserPromptPart(content=SUB_PLAN_REMINDER)]))
+    return dataclasses.replace(request_context, messages=messages)
 
 # ---------- agent 类型定义 ----------
 
@@ -195,6 +218,14 @@ EXPLORE_INSTRUCTIONS = (
     "调查完成后输出一份简洁的报告：结论放前面，附上关键文件路径作为依据。调用方只能看到你最后输出的报告，看不到中间过程，所以报告要自包含。"
 )
 
+PLAN_INSTRUCTIONS = (
+    "你是一个只读的软件架构 agent，根据交给你的需求和调查结果，阅读代码并设计实现方案。\n"
+    "严禁做任何修改：不要创建或改动文件。读代码用 read_file，run_command 只用来执行 ls、grep、cat 这类简单的只读命令，不要运行测试和脚本，也不要执行有副作用的命令。\n"
+    "先弄清现有的架构和写法，方案要沿用已有的模式，并权衡设计上的取舍。\n"
+    "完成后输出方案：分步骤的实现方法、步骤之间的先后顺序、需要注意的风险，最后列出对实现最关键的 3-5 个文件。调用方只能看到你最后输出的报告，看不到中间过程，所以报告要自包含。"
+)
+
+
 GENERAL_INSTRUCTIONS = (
     "你是主 agent 派出的 sub agent，独立完成交给你的任务，可以读写文件和执行命令。\n"
     "修改已有文件前必须先用 read_file 读取它。改动局部内容时优先用 edit_file，新建文件或整体重写才用 write_file。\n"
@@ -207,6 +238,14 @@ _register(AgentType(
     description="只读的代码调查 agent：搜索、阅读代码来回答「X 在哪」「Y 是怎么实现的」这类问题，不做任何修改",
     tool_names=["read_file", "run_command"],
     instructions=EXPLORE_INSTRUCTIONS,
+    source="built-in",
+))
+
+_register(AgentType(
+    name="plan",
+    description="只读的方案设计 agent：根据需求和调查结果设计实现方案，给出实现步骤、关键文件和风险，不做任何修改",
+    tool_names=["read_file", "run_command"],
+    instructions=PLAN_INSTRUCTIONS,
     source="built-in",
 ))
 

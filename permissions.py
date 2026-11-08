@@ -8,29 +8,36 @@
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # 从 prompt_toolkit 导入构建终端交互 UI 所需的组件
+from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, in_terminal
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
+from rich.markdown import Markdown
+from rich.panel import Panel
 
 from memory import store
+from ui.render import console
 
 # 四种权限模式: default / acceptEdits / bypass / auto
 # default 模式：读行，写、跑命令需审批
 DEFAULT = "default"
 # acceptEdits 模式：读写都行，跑命令需审批
 ACCEPT_EDITS = "acceptEdits"
+# plan：只读地探索和规划，写文件只放行 plan 文件，其他非只读工具每次都要审批
+PLAN = "plan"
 # auto：本该弹窗的调用交给 LLM classifier 判定，安全就放行，危险才拦截
 AUTO = "auto"
 # bypass 模式：一切放行
 BYPASS = "bypass"
 
-# 权限模式按 Shift+Tab 切换模式
-MODES = [DEFAULT, ACCEPT_EDITS, AUTO, BYPASS]
+# 权限模式按 Shift+Tab 循环切换的顺序，plan 紧跟在 acceptEdits 后面
+MODES = [DEFAULT, ACCEPT_EDITS, PLAN, AUTO, BYPASS]
 
 # 只读工具，任何模式都自动放行（读取不会改动系统，放行没风险）
 # task_* 工具只触碰 ~/.my-claude-code/tasks/ 下的私有数据目录，不影响用户工程目录和系统状态，按只读工具放行不弹审批
@@ -47,6 +54,8 @@ READONLY_TOOLS = {
     "task_update", 
     "job_kill", 
     "run_agent", 
+    "enter_plan_mode", 
+    "exit_plan_mode",
 }
 # 编辑文件类工具表，acceptEdits 模式下自动放行
 EDIT_TOOLS = {"write_file", "edit_file"}
@@ -71,6 +80,8 @@ class PermissionState:
     """
     # 当前权限模式
     mode: str = DEFAULT
+    # 进入 plan 模式之前的模式，计划批准后切回这里
+    pre_plan_mode: str = DEFAULT
     # 本会话内点过「不再询问」的工具名，后续直接放行
     session_allowed: set = field(default_factory=set)
 
@@ -78,7 +89,7 @@ class PermissionState:
 state = PermissionState()
 
 
-def compute_decision(tool_name: str, args: dict) -> str:
+def compute_decision(tool_name: str, args: dict, plan_file: Path | None = None) -> str:
     """
     核心决策引擎：评估当前工具调用是直接放行 ("allow") 还是拦截弹窗 ("ask")
     """
@@ -88,6 +99,17 @@ def compute_decision(tool_name: str, args: dict) -> str:
     # 2. 工具自检：此时才去调用tools.py里注册的 run_command_self_check()，检查命令是否高危
     # 最高优先权：如果自检函数返回 "ask"，则直接要求用户审批
     check = TOOL_SELF_CHECKS.get(tool_name)
+    verdict = check(args) if check else None
+    # plan 模式单独判定，不走后面的会话白名单，点过「不再询问」也不能在规划阶段改动系统
+    if state.mode == PLAN:
+        # 写文件只放行 plan 文件，其余一律拒绝
+        if tool_name in EDIT_TOOLS:
+            if plan_file and _is_same_file(args.get("path", ""), plan_file):
+                return "allow"
+            return "deny"
+        # 只读工具和自检确认安全的调用（比如 ls、grep 这类只读命令）放行，其余每次都问
+        return "allow" if tool_name in READONLY_TOOLS or verdict == "allow" else "ask"
+    # 自检的结论优先于会话白名单：要求审批的调用，点过「不再询问」也盖不过
     verdict = check(args) if check else None
     if verdict:
         return verdict
@@ -107,13 +129,21 @@ def compute_decision(tool_name: str, args: dict) -> str:
     # 6. default 模式，或没命中任何放行规则：询问用户
     return "ask"
 
+def _is_same_file(path: str, target: Path) -> bool:
+    return bool(path) and Path(path).resolve() == target.resolve()
+
+def set_mode(mode: str) -> None:
+    # 切进 plan 模式时记下原来的模式，计划批准后切回去
+    if mode == PLAN and state.mode != PLAN:
+        state.pre_plan_mode = state.mode
+    state.mode = mode
 
 def cycle_mode() -> str:
     """
     按 default -> acceptEdits -> auto -> bypass -> default tab切换。
     """
     index = MODES.index(state.mode)
-    state.mode = MODES[(index + 1) % len(MODES)]
+    set_mode(MODES[(index + 1) % len(MODES)])
     return state.mode
 
 
@@ -234,3 +264,19 @@ async def prompt_approval(tool_name: str, args: dict, requester: str = "") -> st
         question = f"{requester}是否允许执行 {_format_call(tool_name, args)}？"
         choice = await _ApprovalPicker(question, options).run()
     return choice
+
+async def prompt_plan_approval(plan: str, plan_file: Path) -> tuple[str, str]:
+    """
+    展示计划并弹出审批 picker，返回（选择, 反馈）：选择是 "approve"、表示继续规划的 "keep"，或按 Esc 取消时的 "deny"。
+    """
+    options = [
+        ("approve", f"批准，回到 {state.pre_plan_mode} 模式开始实现"),
+        ("keep", "不批准，继续完善计划"),
+    ]
+    feedback = ""
+    async with in_terminal():
+        console.print(Panel(Markdown(plan), title=str(plan_file), border_style="magenta"))
+        choice = await _ApprovalPicker("是否批准这份计划，开始动手？", options).run()
+        if choice == "keep":
+            feedback = await PromptSession().prompt_async("告诉模型要改什么（直接回车跳过）：")
+    return choice, feedback.strip()

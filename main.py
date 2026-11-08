@@ -10,7 +10,6 @@
 """
 import asyncio # Python 标准异步库，支持 async/await 协程语法
 
-from openai import skills
 from pydantic_ai import Agent # End 是 PydanticAI 图状态机的终点节点。每个模型请求/工具调用都是一个 Node，遇到 End 循环终止
 from pydantic_graph import End
 
@@ -18,6 +17,7 @@ import compact
 import images
 import mcp_servers
 import permissions
+import plan_mode
 import session
 import skills
 import subagents
@@ -124,6 +124,8 @@ async def run_agent_loop(user_input, state, attachments=None):
         tasks_store=state.tasks_store,
         file_history=state.file_history,
         job_registry=state.job_registry,
+        plan_file=plan_mode.plan_file_path(state.session_id),
+
     )
  
     # 开启 Agent 图迭代器上下文，传入当前输入 + 全量历史上下文 (state.history) + mcp工具
@@ -154,6 +156,7 @@ async def main():
     session_id = session.new_session_id()
     # 启动时建好记忆目录，system prompt 里承诺过「目录已存在」，模型就不必浪费回合去确认
     store.ensure_memory_dir()
+    plan_mode.ensure_plans_dir()
     # 本会话的 TasksStore 落盘在 ~/.my-code-agent/tasks/<session_id>/，会话级隔离
     tasks_store = TasksStore(session_id=session_id)
     state = SessionState(

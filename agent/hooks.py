@@ -19,8 +19,10 @@ from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, User
 
 import classifier
 import permissions
+import plan_mode
 from ui.render import console, print_step, print_system_text
 
+from .deps import AgentDeps
 from .reminders import build_job_notifications, build_file_reminder_text, build_task_reminder_text
 
 MAX_RETRIES = 3
@@ -140,6 +142,8 @@ def _scan_task_turn_counters(messages) -> tuple[int, int]:
             break
     return since_mgmt, since_reminder
 
+def _build_plan_reminder(ctx, messages) -> str | None:
+    return plan_mode.build_plan_reminder(messages, ctx.deps.plan_file)
 
 def _build_file_reminder(ctx, messages) -> str | None:
     """过期文件提醒构建器：检测 ReadFileState 账本是否有文件被外部改过"""
@@ -166,7 +170,7 @@ _REMINDER_SENTINELS = {
     # task reminder 的识别串就是它正文里 builder 必定带的那句话，不再单独嵌一个 marker
     "task": "task 工具最近没有被使用",
 }
-_REMINDER_BUILDERS = (_build_file_reminder, _build_task_reminder, _build_job_reminder)
+_REMINDER_BUILDERS = (_build_plan_reminder, _build_file_reminder, _build_task_reminder, _build_job_reminder)
 
 
 @hooks.on.before_model_request
@@ -245,10 +249,13 @@ async def _check_permission(ctx, *, call, tool_def, args, handler):
     返回说明:
         返回工具的实际执行结果，或者返回拒绝说明字符串给大模型。
     """
-    decision = permissions.compute_decision(call.tool_name, args)
+    decision = permissions.compute_decision(call.tool_name, args, ctx.deps.plan_file)
     if decision == "allow":
         # 放行，handler(args) 才是真正执行工具的那一步
         return await handler(args)
+    if decision == "deny":
+        # plan 模式下写了 plan 文件以外的文件：不执行，把规则和 plan 文件位置告诉模型
+        return f"当前处于 plan 模式，除了 plan 文件（{ctx.deps.plan_file}）不能修改任何文件，这次 {call.tool_name} 调用没有执行。请继续只读地探索，把方案写进 plan 文件。"
 
     # 当规则要求询问 ("ask") 且处于 AUTO 模式：交由 classifier 智能审查
     if permissions.state.mode == permissions.AUTO:
