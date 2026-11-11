@@ -1,4 +1,4 @@
-# Adrian Code Agent
+# Code Runner Agent
 
 Local-first coding agent for terminal workflows, inspired by the operational model of Claude Code but intentionally simplified and tailored for a local, controllable developer environment.
 
@@ -11,13 +11,13 @@ Local-first coding agent for terminal workflows, inspired by the operational mod
 
 ## Why this project
 
-Adrian Code Agent is a private, local-first coding assistant designed for the same core operating model that modern agentic IDEs and terminal tools rely on: persistent context, structured tool use, task orchestration, memory retrieval, and safety-aware execution.
+Code Runner Agent is a private, local-first coding assistant designed for the same core operating model that modern agentic IDEs and terminal tools rely on: persistent context, structured tool use, task orchestration, memory retrieval, and safety-aware execution.
 
 It is not a generic chatbot bolted onto a terminal. It is a lightweight, maintainable agent runtime built for real coding work: inspect files, patch code, run commands, manage background jobs, recall prior context, and keep risky actions under explicit control. The spirit is intentionally aligned with tools like Codex and Claude Code, but the implementation stays smaller, more transparent, and easier to extend locally.
 
 ## What it does
 
-Adrian Code Agent is built around a practical operating model for local software work:
+Code Runner Agent is built around a practical operating model for local software work:
 
 - REPL-driven agent loop for iterative coding workflows
 - File-aware editing and context grounding for targeted code changes
